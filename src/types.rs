@@ -1,5 +1,7 @@
-pub type Price = u64;
-pub type Quantity = u64;
+use rust_decimal::Decimal;
+
+pub type Price = Decimal;
+pub type Quantity = Decimal;
 pub type OrderId = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
