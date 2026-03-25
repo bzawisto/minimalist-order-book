@@ -76,30 +76,28 @@ impl OrderBook {
             .remove(&id)
             .ok_or(OrderError::NotFound(id))?;
 
-        if let Some(list) = self.bids.get_mut(&Reverse(price)) {
-            if let Some(pos) = list.iter().position(|o| o.id == id) {
-                // Map the trailing region directly via slice::copy_within which is just ptr::copy memory shift
-                list.copy_within((pos + 1).., pos);
-                list.pop();
+        if let Some(list) = self.bids.get_mut(&Reverse(price))
+            && let Some(pos) = list.iter().position(|o| o.id == id)
+        {
+            list.copy_within((pos + 1).., pos);
+            list.pop();
 
-                if list.is_empty() {
-                    self.bids.remove(&Reverse(price));
-                }
-                return Ok(());
+            if list.is_empty() {
+                self.bids.remove(&Reverse(price));
             }
+            return Ok(());
         }
 
-        if let Some(list) = self.asks.get_mut(&price) {
-            if let Some(pos) = list.iter().position(|o| o.id == id) {
-                // Map the trailing region directly via slice::copy_within which is just ptr::copy memory shift
-                list.copy_within((pos + 1).., pos);
-                list.pop();
+        if let Some(list) = self.asks.get_mut(&price)
+            && let Some(pos) = list.iter().position(|o| o.id == id)
+        {
+            list.copy_within((pos + 1).., pos);
+            list.pop();
 
-                if list.is_empty() {
-                    self.asks.remove(&price);
-                }
-                return Ok(());
+            if list.is_empty() {
+                self.asks.remove(&price);
             }
+            return Ok(());
         }
 
         // We shouldn't hit this if the index and orderbook are perfectly synchronized
