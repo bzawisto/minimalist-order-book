@@ -27,12 +27,13 @@ const fn is_power_of_two(n: usize) -> bool {
 /// modulo. `head` and `tail` are raw monotonic counters; actual array index =
 /// `counter as usize & MASK`.
 ///
-/// Fullness is determined by `live_count == DEPTH` — cancelling an entry
-/// immediately frees a logical slot without needing to drain tombstones first.
+/// Fullness is determined by physical saturation: `tail - head == DEPTH`.
+/// Cancelling an entry tombstones it but does not free physical capacity —
+/// only consuming entries from the front (advancing `head`) does.
+/// DEPTH should be sized so the level never overflows.
 ///
-/// Head is never advanced eagerly. The matching engine iterates from `head` to
-/// `tail` and skips tombstones (qty == 0) inline — no pop/peek needed. Head
-/// only advances lazily inside `push` when physical space must be reclaimed.
+/// Head never moves. Tail only advances on `push`. The matching engine
+/// iterates from `head` to `tail` and skips tombstones (qty == 0) inline.
 pub struct RingLevel<const DEPTH: usize> {
     entries: [Entry; DEPTH],
     head: u32,
@@ -65,7 +66,7 @@ impl<const DEPTH: usize> RingLevel<DEPTH> {
     }
 
     pub fn is_full(&self) -> bool {
-        self.live_count == DEPTH as u32
+        (self.tail - self.head) as usize == DEPTH
     }
 
     pub fn head(&self) -> u32 {
@@ -88,16 +89,19 @@ impl<const DEPTH: usize> RingLevel<DEPTH> {
         &mut self.entries[slot]
     }
 
-    /// Insert an entry at the tail. Returns the slot index, or `None` if full.
+    /// Insert an entry at `tail`. Returns the slot index, or `None` if full.
+    ///
+    /// Full means `tail - head == DEPTH` — the physical ring is saturated.
+    /// Cancel does not free physical slots; only consuming from the front
+    /// (advancing `head`) does. New entries always go at `tail & MASK`,
+    /// preserving FIFO order.
     pub fn push(&mut self, order_id: OrderId, qty: Quantity) -> Option<u16> {
         if self.is_full() {
             return None;
         }
-        // Reclaim physical space by advancing head past tombstones if needed
-        self.reclaim_physical_space();
         let s = Self::slot(self.tail) as u16;
         self.entries[s as usize] = Entry { order_id, qty };
-        self.tail = self.tail.wrapping_add(1);
+        self.tail += 1;
         self.live_count += 1;
         Some(s)
     }
@@ -108,14 +112,6 @@ impl<const DEPTH: usize> RingLevel<DEPTH> {
         debug_assert!(self.entries[slot as usize].qty > Decimal::ZERO);
         self.entries[slot as usize].qty = Decimal::ZERO;
         self.live_count -= 1;
-    }
-
-    /// When physical span (tail - head) fills the array but live_count says
-    /// there's room, advance head past tombstones to free physical slots.
-    fn reclaim_physical_space(&mut self) {
-        while self.tail.wrapping_sub(self.head) >= DEPTH as u32 {
-            self.head = self.head.wrapping_add(1);
-        }
     }
 }
 
@@ -140,7 +136,7 @@ mod tests {
             if e.qty > Decimal::ZERO {
                 out.push((e.order_id, e.qty));
             }
-            cursor = cursor.wrapping_add(1);
+            cursor += 1;
         }
         out
     }
@@ -187,28 +183,22 @@ mod tests {
     }
 
     #[test]
-    fn test_wrap_around() {
+    fn test_cancel_does_not_free_physical_capacity() {
         let mut ring = RingLevel::<4>::new();
 
-        // Fill and cancel twice to force head/tail past DEPTH
-        for round in 0..2 {
-            let base = round * 4 + 1;
-            let s0 = ring.push(base, Decimal::from(10)).unwrap();
-            let s1 = ring.push(base + 1, Decimal::from(20)).unwrap();
-            let s2 = ring.push(base + 2, Decimal::from(30)).unwrap();
-            let s3 = ring.push(base + 3, Decimal::from(40)).unwrap();
+        // Push 4 entries to fill the ring
+        ring.push(1, Decimal::from(10)).unwrap();
+        let s1 = ring.push(2, Decimal::from(20)).unwrap();
+        ring.push(3, Decimal::from(30)).unwrap();
+        ring.push(4, Decimal::from(40)).unwrap();
+        assert!(ring.is_full());
 
-            let live = collect_live(&ring);
-            assert_eq!(live.len(), 4);
-            assert_eq!(live[0].0, base);
-            assert_eq!(live[3].0, base + 3);
+        // Cancel doesn't free physical capacity — still full
+        ring.cancel(s1);
+        assert!(ring.is_full());
 
-            ring.cancel(s0);
-            ring.cancel(s1);
-            ring.cancel(s2);
-            ring.cancel(s3);
-            assert!(ring.is_empty());
-        }
+        // Can't push even though there's a tombstone
+        assert!(ring.push(5, Decimal::from(50)).is_none());
     }
 
     #[test]
@@ -241,22 +231,20 @@ mod tests {
     }
 
     #[test]
-    fn test_cancel_all_then_push() {
+    fn test_cancel_tombstones_but_scan_skips() {
         let mut ring = RingLevel::<4>::new();
-        let s1 = ring.push(1, Decimal::from(10)).unwrap();
+        ring.push(1, Decimal::from(10)).unwrap();
         let s2 = ring.push(2, Decimal::from(20)).unwrap();
-        let s3 = ring.push(3, Decimal::from(30)).unwrap();
-
-        ring.cancel(s1);
-        ring.cancel(s2);
-        ring.cancel(s3);
-        assert!(ring.is_empty());
-        assert!(!ring.is_full());
-
-        // Push reclaims physical space from tombstones automatically
+        ring.push(3, Decimal::from(30)).unwrap();
         ring.push(4, Decimal::from(40)).unwrap();
+
+        ring.cancel(s2);
+
+        // Scan still sees the 3 live entries, skipping the tombstone
         let live = collect_live(&ring);
-        assert_eq!(live.len(), 1);
-        assert_eq!(live[0].0, 4);
+        assert_eq!(live.len(), 3);
+        assert_eq!(live[0].0, 1);
+        assert_eq!(live[1].0, 3);
+        assert_eq!(live[2].0, 4);
     }
 }
