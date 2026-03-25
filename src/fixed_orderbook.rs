@@ -17,10 +17,6 @@ pub enum FixedBookError {
     NotFound(OrderId),
 }
 
-// ---------------------------------------------------------------------------
-// FixedBookSide
-// ---------------------------------------------------------------------------
-
 pub struct FixedBookSide<const LEVELS: usize, const DEPTH: usize> {
     levels: Box<[RingLevel<DEPTH>; LEVELS]>,
     side: Side,
@@ -43,7 +39,7 @@ impl<const LEVELS: usize, const DEPTH: usize> FixedBookSide<LEVELS, DEPTH> {
             .unwrap_or_else(|_| unreachable!())
     }
 
-    /// Push an order into the ring at `level_idx`. Returns the slot index.
+    /// Push an order into the level at `level_idx`. Returns the slot index.
     pub fn push_at(&mut self, level_idx: usize, order_id: OrderId, qty: Quantity) -> Option<u16> {
         let slot = self.levels[level_idx].push(order_id, qty)?;
         self.update_best_after_insert(level_idx);
@@ -86,10 +82,6 @@ impl<const LEVELS: usize, const DEPTH: usize> FixedBookSide<LEVELS, DEPTH> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// FixedOrderBook
-// ---------------------------------------------------------------------------
 
 pub struct FixedOrderBook<const LEVELS: usize, const DEPTH: usize> {
     bids: FixedBookSide<LEVELS, DEPTH>,
@@ -139,9 +131,8 @@ impl<const LEVELS: usize, const DEPTH: usize> FixedOrderBook<LEVELS, DEPTH> {
 
     /// Compact a level by removing tombstones.
     ///
-    /// Copies live entries into the scratch buffer, then swaps it with the
-    /// target level, resetting head/tail to a tight range. Updates the
-    /// order_index for all moved entries.
+    /// Copies live entries into the scratch buffer, swaps it with the target
+    /// level, then updates the order_index with new slot positions.
     pub fn compact_level(&mut self, side: Side, level_idx: usize) {
         let Self {
             bids,

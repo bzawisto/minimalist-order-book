@@ -14,8 +14,6 @@ use crate::{
 pub enum OrderError {
     #[error("Order ID {0} not found")]
     NotFound(OrderId),
-    #[error("Wait")]
-    Other,
 }
 
 pub struct OrderBook {

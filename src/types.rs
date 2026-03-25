@@ -9,9 +9,3 @@ pub enum Side {
     Buy,
     Sell,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderType {
-    Limit,
-    Market,
-}

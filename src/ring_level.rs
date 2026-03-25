@@ -6,20 +6,16 @@ const fn is_power_of_two(n: usize) -> bool {
     n > 0 && (n & (n - 1)) == 0
 }
 
-/// Fixed-capacity circular buffer for orders at a single price level.
+/// Fixed-capacity append-only buffer for orders at a single price level.
 ///
 /// Uses a Struct-of-Arrays (SoA) layout: `qtys` and `order_ids` are stored in
-/// separate contiguous arrays. A separate bitmap tracks live/dead status so
-/// the scan path only touches ~128 bytes (for DEPTH=1024) instead of the
-/// 16KB qty array.
+/// separate contiguous arrays. A bitmap tracks live/dead status so the scan
+/// path only touches ~128 bytes (for DEPTH=1024) instead of the 16KB qty array.
 ///
-/// DEPTH must be a power of two so we can use bitmask indexing instead of
-/// modulo. `head` and `tail` are raw monotonic counters; actual array index =
-/// `counter as usize & MASK`.
-///
-/// Fullness is determined by physical saturation: `tail - head == DEPTH`.
-/// Cancelling an entry tombstones it but does not free physical capacity —
-/// only consuming entries from the front (advancing `head`) does.
+/// DEPTH must be a power of two for bitmask indexing (`slot = counter & MASK`).
+/// `tail` advances on each `push`; the buffer is full when `tail - head == DEPTH`.
+/// Cancelling clears a bitmap bit but does not free the physical slot.
+/// Use `compact_level` on the parent book to reclaim tombstoned slots.
 pub struct RingLevel<const DEPTH: usize> {
     // Warm: read only when bitmap says entry is live
     qtys: [Quantity; DEPTH],
@@ -98,11 +94,6 @@ impl<const DEPTH: usize> RingLevel<DEPTH> {
     }
 
     /// Insert an entry at `tail`. Returns the slot index, or `None` if full.
-    ///
-    /// Full means `tail - head == DEPTH` — the physical ring is saturated.
-    /// Cancel does not free physical slots; only consuming from the front
-    /// (advancing `head`) does. New entries always go at `tail & MASK`,
-    /// preserving FIFO order.
     pub fn push(&mut self, order_id: OrderId, qty: Quantity) -> Option<u16> {
         if self.is_full() {
             return None;
