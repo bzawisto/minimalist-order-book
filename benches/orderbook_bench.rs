@@ -66,8 +66,8 @@ fn bench_insert(c: &mut Criterion) {
             b.iter_batched(
                 || (generate_orders(levels, ORDER_COUNT, SEED), OrderBook::new()),
                 |(orders, mut book)| {
-                    for (side, price, qty) in orders {
-                        book.add_limit_order(side, price, qty, 0);
+                    for (i, (side, price, qty)) in orders.into_iter().enumerate() {
+                        book.add_limit_order((i + 1) as u64, side, price, qty);
                     }
                     book // return so drop is excluded from timing
                 },
@@ -92,8 +92,8 @@ fn bench_insert(c: &mut Criterion) {
                         )
                     },
                     |(orders, mut book)| {
-                        for (side, price, qty) in orders {
-                            let _ = book.add_limit_order(side, price, qty);
+                        for (i, (side, price, qty)) in orders.into_iter().enumerate() {
+                            let _ = book.add_limit_order((i + 1) as u64, side, price, qty, 0);
                         }
                         book
                     },
@@ -125,7 +125,10 @@ fn bench_cancel(c: &mut Criterion) {
                     let mut book = OrderBook::new();
                     let ids: Vec<_> = orders
                         .iter()
-                        .map(|&(side, price, qty)| book.add_limit_order(side, price, qty, 0))
+                        .enumerate()
+                        .map(|(i, &(side, price, qty))| {
+                            book.add_limit_order((i + 1) as u64, side, price, qty)
+                        })
                         .collect();
                     let mut shuffled = ids;
                     shuffled.shuffle(&mut StdRng::seed_from_u64(SEED + 1));
@@ -154,8 +157,10 @@ fn bench_cancel(c: &mut Criterion) {
                         );
                         let ids: Vec<_> = orders
                             .iter()
-                            .filter_map(|&(side, price, qty)| {
-                                book.add_limit_order(side, price, qty).ok()
+                            .enumerate()
+                            .filter_map(|(i, &(side, price, qty))| {
+                                book.add_limit_order((i + 1) as u64, side, price, qty, 0)
+                                    .ok()
                             })
                             .collect();
                         let mut shuffled = ids;
@@ -198,8 +203,8 @@ fn bench_insert_clustered(c: &mut Criterion) {
                     )
                 },
                 |(orders, mut book)| {
-                    for (side, price, qty) in orders {
-                        book.add_limit_order(side, price, qty, 0);
+                    for (i, (side, price, qty)) in orders.into_iter().enumerate() {
+                        book.add_limit_order((i + 1) as u64, side, price, qty);
                     }
                     book
                 },
@@ -222,8 +227,8 @@ fn bench_insert_clustered(c: &mut Criterion) {
                         )
                     },
                     |(orders, mut book)| {
-                        for (side, price, qty) in orders {
-                            let _ = book.add_limit_order(side, price, qty);
+                        for (i, (side, price, qty)) in orders.into_iter().enumerate() {
+                            let _ = book.add_limit_order((i + 1) as u64, side, price, qty, 0);
                         }
                         book
                     },
@@ -255,7 +260,10 @@ fn bench_cancel_clustered(c: &mut Criterion) {
                     let mut book = OrderBook::new();
                     let ids: Vec<_> = orders
                         .iter()
-                        .map(|&(side, price, qty)| book.add_limit_order(side, price, qty, 0))
+                        .enumerate()
+                        .map(|(i, &(side, price, qty))| {
+                            book.add_limit_order((i + 1) as u64, side, price, qty)
+                        })
                         .collect();
                     let mut shuffled = ids;
                     shuffled.shuffle(&mut StdRng::seed_from_u64(SEED + 1));
@@ -284,8 +292,10 @@ fn bench_cancel_clustered(c: &mut Criterion) {
                         );
                         let ids: Vec<_> = orders
                             .iter()
-                            .filter_map(|&(side, price, qty)| {
-                                book.add_limit_order(side, price, qty).ok()
+                            .enumerate()
+                            .filter_map(|(i, &(side, price, qty))| {
+                                book.add_limit_order((i + 1) as u64, side, price, qty, 0)
+                                    .ok()
                             })
                             .collect();
                         let mut shuffled = ids;

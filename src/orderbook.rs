@@ -25,7 +25,6 @@ pub struct OrderBook {
     pub asks: BTreeMap<Price, Vec<Order>>,
     // Index to quickly find an order by its ID
     pub order_index: HashMap<OrderId, Price>,
-    next_order_id: OrderId,
 }
 
 impl OrderBook {
@@ -34,26 +33,21 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             order_index: HashMap::new(),
-            next_order_id: 1,
         }
     }
 
     pub fn add_limit_order(
         &mut self,
+        id: OrderId,
         side: Side,
         price: Price,
         qty: Quantity,
-        timestamp: u64,
     ) -> OrderId {
         let order = Order {
-            id: self.next_order_id,
-            side,
+            id,
             price,
             quantity: qty,
-            remaining: qty,
-            timestamp,
         };
-        self.next_order_id += 1;
 
         let order_id = order.id;
         self.order_index.insert(order_id, price);
@@ -143,8 +137,8 @@ mod tests {
     #[test]
     fn test_add_and_cancel_order() {
         let mut order_book = OrderBook::new();
-        let id1 = order_book.add_limit_order(Side::Buy, Decimal::from(100), Decimal::from(10), 0);
-        let id2 = order_book.add_limit_order(Side::Sell, Decimal::from(105), Decimal::from(10), 1);
+        let id1 = order_book.add_limit_order(1, Side::Buy, Decimal::from(100), Decimal::from(10));
+        let id2 = order_book.add_limit_order(2, Side::Sell, Decimal::from(105), Decimal::from(10));
 
         assert_eq!(order_book.best_bid(), Some(Decimal::from(100)));
         assert_eq!(order_book.best_ask(), Some(Decimal::from(105)));
@@ -170,49 +164,44 @@ mod tests {
     #[test]
     fn test_best_bid_ask_ordering() {
         let mut order_book = OrderBook::new();
-        order_book.add_limit_order(Side::Buy, Decimal::from(100), Decimal::from(10), 0);
-        order_book.add_limit_order(Side::Buy, Decimal::from(110), Decimal::from(10), 1);
-        order_book.add_limit_order(Side::Buy, Decimal::from(105), Decimal::from(10), 2);
+        order_book.add_limit_order(1, Side::Buy, Decimal::from(100), Decimal::from(10));
+        order_book.add_limit_order(2, Side::Buy, Decimal::from(110), Decimal::from(10));
+        order_book.add_limit_order(3, Side::Buy, Decimal::from(105), Decimal::from(10));
         assert_eq!(order_book.best_bid(), Some(Decimal::from(110)));
 
-        order_book.add_limit_order(Side::Sell, Decimal::from(120), Decimal::from(10), 3);
-        order_book.add_limit_order(Side::Sell, Decimal::from(115), Decimal::from(10), 4);
-        order_book.add_limit_order(Side::Sell, Decimal::from(125), Decimal::from(10), 5);
+        order_book.add_limit_order(4, Side::Sell, Decimal::from(120), Decimal::from(10));
+        order_book.add_limit_order(5, Side::Sell, Decimal::from(115), Decimal::from(10));
+        order_book.add_limit_order(6, Side::Sell, Decimal::from(125), Decimal::from(10));
         assert_eq!(order_book.best_ask(), Some(Decimal::from(115)));
     }
 
     #[test]
     fn test_spread() {
         let mut order_book = OrderBook::new();
-        // Initially, the book is empty, so spread is None
         assert_eq!(order_book.spread(), None);
 
-        // Add a single side, spread should still be None
-        order_book.add_limit_order(Side::Buy, Decimal::from(100), Decimal::from(10), 0);
+        order_book.add_limit_order(1, Side::Buy, Decimal::from(100), Decimal::from(10));
         assert_eq!(order_book.spread(), None);
 
-        // Add the other side, now spread should exist
-        order_book.add_limit_order(Side::Sell, Decimal::from(105), Decimal::from(10), 1);
+        order_book.add_limit_order(2, Side::Sell, Decimal::from(105), Decimal::from(10));
         assert_eq!(
             order_book.spread(),
             Some((Decimal::from(100), Decimal::from(105)))
         );
 
-        // Narrow the spread
-        order_book.add_limit_order(Side::Buy, Decimal::from(102), Decimal::from(10), 2);
-        order_book.add_limit_order(Side::Sell, Decimal::from(104), Decimal::from(10), 3);
+        order_book.add_limit_order(3, Side::Buy, Decimal::from(102), Decimal::from(10));
+        order_book.add_limit_order(4, Side::Sell, Decimal::from(104), Decimal::from(10));
         assert_eq!(
             order_book.spread(),
             Some((Decimal::from(102), Decimal::from(104)))
         );
 
-        // Remove the inner orders, spread should widen again
-        let id1 = order_book.add_limit_order(Side::Buy, Decimal::from(103), Decimal::from(10), 4);
+        let id5 = order_book.add_limit_order(5, Side::Buy, Decimal::from(103), Decimal::from(10));
         assert_eq!(
             order_book.spread(),
             Some((Decimal::from(103), Decimal::from(104)))
         );
-        order_book.cancel_order(id1).unwrap();
+        order_book.cancel_order(id5).unwrap();
         assert_eq!(
             order_book.spread(),
             Some((Decimal::from(102), Decimal::from(104)))

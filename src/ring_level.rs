@@ -3,9 +3,11 @@ use rust_decimal::Decimal;
 use crate::types::{OrderId, Quantity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(64))]
 pub struct Entry {
     pub order_id: OrderId,
     pub qty: Quantity, // 0 = cancelled or fully filled (tombstone)
+    pub timestamp: u64,
 }
 
 impl Default for Entry {
@@ -13,6 +15,7 @@ impl Default for Entry {
         Self {
             order_id: 0,
             qty: Decimal::ZERO,
+            timestamp: 0,
         }
     }
 }
@@ -95,12 +98,16 @@ impl<const DEPTH: usize> RingLevel<DEPTH> {
     /// Cancel does not free physical slots; only consuming from the front
     /// (advancing `head`) does. New entries always go at `tail & MASK`,
     /// preserving FIFO order.
-    pub fn push(&mut self, order_id: OrderId, qty: Quantity) -> Option<u16> {
+    pub fn push(&mut self, order_id: OrderId, qty: Quantity, timestamp: u64) -> Option<u16> {
         if self.is_full() {
             return None;
         }
         let s = Self::slot(self.tail) as u16;
-        self.entries[s as usize] = Entry { order_id, qty };
+        self.entries[s as usize] = Entry {
+            order_id,
+            qty,
+            timestamp,
+        };
         self.tail += 1;
         self.live_count += 1;
         Some(s)
@@ -112,6 +119,13 @@ impl<const DEPTH: usize> RingLevel<DEPTH> {
         debug_assert!(self.entries[slot as usize].qty > Decimal::ZERO);
         self.entries[slot as usize].qty = Decimal::ZERO;
         self.live_count -= 1;
+    }
+
+    /// Reset the ring to empty state. Used during compaction.
+    pub fn reset(&mut self) {
+        self.head = 0;
+        self.tail = 0;
+        self.live_count = 0;
     }
 }
 
@@ -146,8 +160,8 @@ mod tests {
         let mut ring = RingLevel::<4>::new();
         assert!(ring.is_empty());
 
-        ring.push(1, Decimal::from(10)).unwrap();
-        ring.push(2, Decimal::from(20)).unwrap();
+        ring.push(1, Decimal::from(10), 0).unwrap();
+        ring.push(2, Decimal::from(20), 0).unwrap();
         assert!(!ring.is_empty());
 
         let live = collect_live(&ring);
@@ -159,9 +173,9 @@ mod tests {
     #[test]
     fn test_cancel_creates_tombstone() {
         let mut ring = RingLevel::<4>::new();
-        ring.push(1, Decimal::from(10)).unwrap();
-        let slot2 = ring.push(2, Decimal::from(20)).unwrap();
-        ring.push(3, Decimal::from(30)).unwrap();
+        ring.push(1, Decimal::from(10), 0).unwrap();
+        let slot2 = ring.push(2, Decimal::from(20), 0).unwrap();
+        ring.push(3, Decimal::from(30), 0).unwrap();
 
         // Cancel the middle entry
         ring.cancel(slot2);
@@ -176,9 +190,9 @@ mod tests {
     #[test]
     fn test_full_rejection() {
         let mut ring = RingLevel::<2>::new();
-        assert!(ring.push(1, Decimal::from(10)).is_some());
-        assert!(ring.push(2, Decimal::from(20)).is_some());
-        assert!(ring.push(3, Decimal::from(30)).is_none());
+        assert!(ring.push(1, Decimal::from(10), 0).is_some());
+        assert!(ring.push(2, Decimal::from(20), 0).is_some());
+        assert!(ring.push(3, Decimal::from(30), 0).is_none());
         assert!(ring.is_full());
     }
 
@@ -187,10 +201,10 @@ mod tests {
         let mut ring = RingLevel::<4>::new();
 
         // Push 4 entries to fill the ring
-        ring.push(1, Decimal::from(10)).unwrap();
-        let s1 = ring.push(2, Decimal::from(20)).unwrap();
-        ring.push(3, Decimal::from(30)).unwrap();
-        ring.push(4, Decimal::from(40)).unwrap();
+        ring.push(1, Decimal::from(10), 0).unwrap();
+        let s1 = ring.push(2, Decimal::from(20), 0).unwrap();
+        ring.push(3, Decimal::from(30), 0).unwrap();
+        ring.push(4, Decimal::from(40), 0).unwrap();
         assert!(ring.is_full());
 
         // Cancel doesn't free physical capacity — still full
@@ -198,14 +212,14 @@ mod tests {
         assert!(ring.is_full());
 
         // Can't push even though there's a tombstone
-        assert!(ring.push(5, Decimal::from(50)).is_none());
+        assert!(ring.push(5, Decimal::from(50), 0).is_none());
     }
 
     #[test]
     fn test_scan_skips_tombstones() {
         let mut ring = RingLevel::<4>::new();
-        let slot1 = ring.push(1, Decimal::from(10)).unwrap();
-        ring.push(2, Decimal::from(20)).unwrap();
+        let slot1 = ring.push(1, Decimal::from(10), 0).unwrap();
+        ring.push(2, Decimal::from(20), 0).unwrap();
 
         ring.cancel(slot1);
 
@@ -219,8 +233,8 @@ mod tests {
         let mut ring = RingLevel::<4>::new();
         assert!(ring.is_empty());
 
-        let s1 = ring.push(1, Decimal::from(10)).unwrap();
-        let s2 = ring.push(2, Decimal::from(20)).unwrap();
+        let s1 = ring.push(1, Decimal::from(10), 0).unwrap();
+        let s2 = ring.push(2, Decimal::from(20), 0).unwrap();
         assert!(!ring.is_empty());
 
         ring.cancel(s1);
@@ -233,10 +247,10 @@ mod tests {
     #[test]
     fn test_cancel_tombstones_but_scan_skips() {
         let mut ring = RingLevel::<4>::new();
-        ring.push(1, Decimal::from(10)).unwrap();
-        let s2 = ring.push(2, Decimal::from(20)).unwrap();
-        ring.push(3, Decimal::from(30)).unwrap();
-        ring.push(4, Decimal::from(40)).unwrap();
+        ring.push(1, Decimal::from(10), 0).unwrap();
+        let s2 = ring.push(2, Decimal::from(20), 0).unwrap();
+        ring.push(3, Decimal::from(30), 0).unwrap();
+        ring.push(4, Decimal::from(40), 0).unwrap();
 
         ring.cancel(s2);
 
