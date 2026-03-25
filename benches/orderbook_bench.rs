@@ -93,7 +93,7 @@ fn bench_insert(c: &mut Criterion) {
                     },
                     |(orders, mut book)| {
                         for (i, (side, price, qty)) in orders.into_iter().enumerate() {
-                            let _ = book.add_limit_order((i + 1) as u64, side, price, qty, 0);
+                            let _ = book.add_limit_order((i + 1) as u64, side, price, qty);
                         }
                         book
                     },
@@ -159,8 +159,7 @@ fn bench_cancel(c: &mut Criterion) {
                             .iter()
                             .enumerate()
                             .filter_map(|(i, &(side, price, qty))| {
-                                book.add_limit_order((i + 1) as u64, side, price, qty, 0)
-                                    .ok()
+                                book.add_limit_order((i + 1) as u64, side, price, qty).ok()
                             })
                             .collect();
                         let mut shuffled = ids;
@@ -228,7 +227,7 @@ fn bench_insert_clustered(c: &mut Criterion) {
                     },
                     |(orders, mut book)| {
                         for (i, (side, price, qty)) in orders.into_iter().enumerate() {
-                            let _ = book.add_limit_order((i + 1) as u64, side, price, qty, 0);
+                            let _ = book.add_limit_order((i + 1) as u64, side, price, qty);
                         }
                         book
                     },
@@ -294,8 +293,7 @@ fn bench_cancel_clustered(c: &mut Criterion) {
                             .iter()
                             .enumerate()
                             .filter_map(|(i, &(side, price, qty))| {
-                                book.add_limit_order((i + 1) as u64, side, price, qty, 0)
-                                    .ok()
+                                book.add_limit_order((i + 1) as u64, side, price, qty).ok()
                             })
                             .collect();
                         let mut shuffled = ids;
