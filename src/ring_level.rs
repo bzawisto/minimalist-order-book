@@ -107,6 +107,11 @@ impl<const DEPTH: usize> RingLevel<DEPTH> {
         Some(s)
     }
 
+    #[inline]
+    pub fn set_qty(&mut self, slot: usize, qty: Quantity) {
+        self.qtys[slot] = qty;
+    }
+
     /// Tombstone an entry by slot index. Clears the bitmap bit.
     /// The qty value is left as-is — the bitmap is the source of truth.
     pub fn cancel(&mut self, slot: u16) {

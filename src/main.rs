@@ -5,29 +5,39 @@ use rust_decimal::Decimal;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("--- Minimalist Order Book Demo ---");
-    let mut order_book = OrderBook::new();
+    let mut book = OrderBook::new();
 
     println!("Adding Buy order: 100 @ $5000");
-    let _id1 = order_book.add_limit_order(1, Side::Buy, Decimal::from(5000), Decimal::from(100));
+    book.add_limit_order(1, Side::Buy, Decimal::from(5000), Decimal::from(100));
 
     println!("Adding Sell order: 50 @ $5100");
-    let _id2 = order_book.add_limit_order(2, Side::Sell, Decimal::from(5100), Decimal::from(50));
+    book.add_limit_order(2, Side::Sell, Decimal::from(5100), Decimal::from(50));
 
     println!("Adding Sell order: 10 @ $5050");
-    let id3 = order_book.add_limit_order(3, Side::Sell, Decimal::from(5050), Decimal::from(10));
+    book.add_limit_order(3, Side::Sell, Decimal::from(5050), Decimal::from(10));
 
     println!("\nCurrent Book State:");
-    println!("Best Bid: {:?}", order_book.best_bid());
-    println!("Best Ask: {:?}", order_book.best_ask());
-    println!("Spread: {:?}", order_book.spread());
+    println!("Best Bid: {:?}", book.best_bid());
+    println!("Best Ask: {:?}", book.best_ask());
+    println!("Spread: {:?}", book.spread());
 
-    println!("\nCanceling active Sell order $5050 (ID: {id3})");
-    order_book.cancel_order(id3)?;
+    println!("\nSending aggressive Buy 200 @ $5100 (crosses both asks)");
+    let fills = book.add_limit_order(4, Side::Buy, Decimal::from(5100), Decimal::from(200));
+    for fill in &fills {
+        println!(
+            "  Fill: {} @ {} (maker={}, taker={})",
+            fill.quantity, fill.price, fill.maker_order_id, fill.taker_order_id
+        );
+    }
 
     println!("\nUpdated Book State:");
-    println!("Best Bid: {:?}", order_book.best_bid());
-    println!("Best Ask: {:?}", order_book.best_ask());
-    println!("Spread: {:?}", order_book.spread());
+    println!("Best Bid: {:?}", book.best_bid());
+    println!("Best Ask: {:?}", book.best_ask());
+    println!("Spread: {:?}", book.spread());
+
+    println!("\nCanceling resting bid (ID: 4)");
+    book.cancel_order(4)?;
+    println!("Best Bid: {:?}", book.best_bid());
 
     Ok(())
 }

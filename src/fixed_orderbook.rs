@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{
     ring_level::RingLevel,
-    types::{OrderId, Price, Quantity, Side},
+    types::{Fill, OrderId, Price, Quantity, Side},
 };
 
 #[derive(Error, Debug)]
@@ -86,7 +86,7 @@ impl<const LEVELS: usize, const DEPTH: usize> FixedBookSide<LEVELS, DEPTH> {
 pub struct FixedOrderBook<const LEVELS: usize, const DEPTH: usize> {
     bids: FixedBookSide<LEVELS, DEPTH>,
     asks: FixedBookSide<LEVELS, DEPTH>,
-    /// Maps order_id → (side, level_index, slot_in_ring)
+    /// Maps order_id -> (side, level_index, slot_in_ring)
     order_index: FxHashMap<OrderId, (Side, usize, u16)>,
     /// Scratch buffer used by `compact_level` to avoid aliasing during compaction.
     scratch: Box<RingLevel<DEPTH>>,
@@ -112,21 +112,136 @@ impl<const LEVELS: usize, const DEPTH: usize> FixedOrderBook<LEVELS, DEPTH> {
         side: Side,
         price: Price,
         qty: Quantity,
-    ) -> Result<OrderId, FixedBookError> {
+    ) -> Result<Vec<Fill>, FixedBookError> {
         let level_idx = self.price_to_index(price)?;
+        let (remaining, fills) = self.match_incoming(id, side, level_idx, qty);
 
-        let book_side = match side {
-            Side::Buy => &mut self.bids,
-            Side::Sell => &mut self.asks,
+        if remaining > Decimal::ZERO {
+            let book_side = match side {
+                Side::Buy => &mut self.bids,
+                Side::Sell => &mut self.asks,
+            };
+            let slot = book_side
+                .push_at(level_idx, id, remaining)
+                .ok_or(FixedBookError::LevelFull(price, DEPTH))?;
+            self.order_index.insert(id, (side, level_idx, slot));
+        }
+
+        Ok(fills)
+    }
+
+    pub fn add_market_order(&mut self, id: OrderId, side: Side, qty: Quantity) -> Vec<Fill> {
+        let limit_level = match side {
+            Side::Buy => LEVELS - 1,
+            Side::Sell => 0,
         };
+        self.match_incoming(id, side, limit_level, qty).1
+    }
 
-        let slot = book_side
-            .push_at(level_idx, id, qty)
-            .ok_or(FixedBookError::LevelFull(price, DEPTH))?;
+    fn match_incoming(
+        &mut self,
+        id: OrderId,
+        side: Side,
+        limit_level: usize,
+        qty: Quantity,
+    ) -> (Quantity, Vec<Fill>) {
+        let mut remaining = qty;
+        let mut fills = Vec::new();
 
-        self.order_index.insert(id, (side, level_idx, slot));
+        match side {
+            Side::Buy => {
+                let ask_best = self.asks.best_level;
+                if let Some(start) = ask_best {
+                    let FixedOrderBook {
+                        asks,
+                        order_index,
+                        base_price,
+                        tick_size,
+                        ..
+                    } = &mut *self;
+                    let mut li = start;
+                    while remaining > Decimal::ZERO && li <= limit_level && li < LEVELS {
+                        let fill_price = *base_price + *tick_size * Decimal::from(li);
+                        let ring = &mut asks.levels[li];
+                        let mut cursor = ring.head();
+                        while remaining > Decimal::ZERO && cursor != ring.tail() {
+                            let slot = RingLevel::<DEPTH>::slot(cursor);
+                            if ring.is_live(slot) {
+                                let maker_qty = ring.qty(slot);
+                                let maker_id = ring.order_id(slot);
+                                let fill_qty = remaining.min(maker_qty);
+                                fills.push(Fill {
+                                    maker_order_id: maker_id,
+                                    taker_order_id: id,
+                                    price: fill_price,
+                                    quantity: fill_qty,
+                                });
+                                remaining -= fill_qty;
+                                if fill_qty == maker_qty {
+                                    ring.cancel(slot as u16);
+                                    order_index.remove(&maker_id);
+                                } else {
+                                    ring.set_qty(slot, maker_qty - fill_qty);
+                                }
+                            }
+                            cursor += 1;
+                        }
+                        li += 1;
+                    }
+                    asks.best_level = asks.scan_for_best();
+                }
+            }
+            Side::Sell => {
+                let bid_best = self.bids.best_level;
+                if let Some(start) = bid_best {
+                    let FixedOrderBook {
+                        bids,
+                        order_index,
+                        base_price,
+                        tick_size,
+                        ..
+                    } = &mut *self;
+                    let mut li = start;
+                    loop {
+                        if remaining <= Decimal::ZERO || li < limit_level {
+                            break;
+                        }
+                        let fill_price = *base_price + *tick_size * Decimal::from(li);
+                        let ring = &mut bids.levels[li];
+                        let mut cursor = ring.head();
+                        while remaining > Decimal::ZERO && cursor != ring.tail() {
+                            let slot = RingLevel::<DEPTH>::slot(cursor);
+                            if ring.is_live(slot) {
+                                let maker_qty = ring.qty(slot);
+                                let maker_id = ring.order_id(slot);
+                                let fill_qty = remaining.min(maker_qty);
+                                fills.push(Fill {
+                                    maker_order_id: maker_id,
+                                    taker_order_id: id,
+                                    price: fill_price,
+                                    quantity: fill_qty,
+                                });
+                                remaining -= fill_qty;
+                                if fill_qty == maker_qty {
+                                    ring.cancel(slot as u16);
+                                    order_index.remove(&maker_id);
+                                } else {
+                                    ring.set_qty(slot, maker_qty - fill_qty);
+                                }
+                            }
+                            cursor += 1;
+                        }
+                        if li == 0 {
+                            break;
+                        }
+                        li -= 1;
+                    }
+                    bids.best_level = bids.scan_for_best();
+                }
+            }
+        }
 
-        Ok(id)
+        (remaining, fills)
     }
 
     /// Compact a level by removing tombstones.
@@ -238,7 +353,7 @@ mod tests {
 
     use super::*;
 
-    /// Book with base=90, tick=1, 30 levels → prices 90..=119
+    /// Book with base=90, tick=1, 30 levels -> prices 90..=119
     fn make_book() -> FixedOrderBook<30, 64> {
         FixedOrderBook::<30, 64>::new(Decimal::from(90), Decimal::from(1))
     }
@@ -246,11 +361,9 @@ mod tests {
     #[test]
     fn test_add_and_cancel_order() {
         let mut book = make_book();
-        let id1 = book
-            .add_limit_order(1, Side::Buy, Decimal::from(100), Decimal::from(10))
+        book.add_limit_order(1, Side::Buy, Decimal::from(100), Decimal::from(10))
             .unwrap();
-        let id2 = book
-            .add_limit_order(2, Side::Sell, Decimal::from(105), Decimal::from(10))
+        book.add_limit_order(2, Side::Sell, Decimal::from(105), Decimal::from(10))
             .unwrap();
 
         assert_eq!(book.best_bid(), Some(Decimal::from(100)));
@@ -260,11 +373,11 @@ mod tests {
             Some((Decimal::from(100), Decimal::from(105)))
         );
 
-        assert!(book.cancel_order(id1).is_ok());
+        assert!(book.cancel_order(1).is_ok());
         assert_eq!(book.best_bid(), None);
         assert_eq!(book.spread(), None);
 
-        assert!(book.cancel_order(id2).is_ok());
+        assert!(book.cancel_order(2).is_ok());
         assert_eq!(book.best_ask(), None);
     }
 
@@ -321,14 +434,13 @@ mod tests {
         );
 
         // Remove inner orders, spread should widen
-        let id5 = book
-            .add_limit_order(5, Side::Buy, Decimal::from(103), Decimal::from(10))
+        book.add_limit_order(5, Side::Buy, Decimal::from(103), Decimal::from(10))
             .unwrap();
         assert_eq!(
             book.spread(),
             Some((Decimal::from(103), Decimal::from(104)))
         );
-        book.cancel_order(id5).unwrap();
+        book.cancel_order(5).unwrap();
         assert_eq!(
             book.spread(),
             Some((Decimal::from(102), Decimal::from(104)))
@@ -338,17 +450,14 @@ mod tests {
     #[test]
     fn test_price_out_of_range() {
         let mut book = make_book(); // prices 90..=119
-        // Below base_price
         assert!(
             book.add_limit_order(1, Side::Buy, Decimal::from(89), Decimal::from(10))
                 .is_err()
         );
-        // Above max
         assert!(
             book.add_limit_order(2, Side::Buy, Decimal::from(120), Decimal::from(10))
                 .is_err()
         );
-        // At boundaries: OK
         assert!(
             book.add_limit_order(3, Side::Buy, Decimal::from(90), Decimal::from(10))
                 .is_ok()
@@ -374,89 +483,288 @@ mod tests {
     #[test]
     fn test_cancel_best_bid_updates_best() {
         let mut book = make_book();
-        let id_110 = book
-            .add_limit_order(1, Side::Buy, Decimal::from(110), Decimal::from(10))
+        book.add_limit_order(1, Side::Buy, Decimal::from(110), Decimal::from(10))
             .unwrap();
         book.add_limit_order(2, Side::Buy, Decimal::from(100), Decimal::from(10))
             .unwrap();
 
         assert_eq!(book.best_bid(), Some(Decimal::from(110)));
-        book.cancel_order(id_110).unwrap();
+        book.cancel_order(1).unwrap();
         assert_eq!(book.best_bid(), Some(Decimal::from(100)));
     }
 
     #[test]
     fn test_cancel_best_ask_updates_best() {
         let mut book = make_book();
-        let id_95 = book
-            .add_limit_order(1, Side::Sell, Decimal::from(95), Decimal::from(10))
+        book.add_limit_order(1, Side::Sell, Decimal::from(95), Decimal::from(10))
             .unwrap();
         book.add_limit_order(2, Side::Sell, Decimal::from(105), Decimal::from(10))
             .unwrap();
 
         assert_eq!(book.best_ask(), Some(Decimal::from(95)));
-        book.cancel_order(id_95).unwrap();
+        book.cancel_order(1).unwrap();
         assert_eq!(book.best_ask(), Some(Decimal::from(105)));
     }
 
     #[test]
     fn test_multiple_orders_same_level_cancel_preserves_best() {
         let mut book = make_book();
-        let id1 = book
-            .add_limit_order(1, Side::Buy, Decimal::from(100), Decimal::from(10))
+        book.add_limit_order(1, Side::Buy, Decimal::from(100), Decimal::from(10))
             .unwrap();
         book.add_limit_order(2, Side::Buy, Decimal::from(100), Decimal::from(20))
             .unwrap();
 
-        // Cancel one order at the best level, but the level still has orders
-        book.cancel_order(id1).unwrap();
+        book.cancel_order(1).unwrap();
         assert_eq!(book.best_bid(), Some(Decimal::from(100)));
     }
 
     #[test]
     fn test_compact_level() {
         let mut book = FixedOrderBook::<10, 8>::new(Decimal::from(100), Decimal::from(1));
-        // Add 4 orders at price 105, cancel 2 in the middle
-        let id1 = book
-            .add_limit_order(1, Side::Buy, Decimal::from(105), Decimal::from(10))
+        book.add_limit_order(1, Side::Buy, Decimal::from(105), Decimal::from(10))
             .unwrap();
-        let _id2 = book
-            .add_limit_order(2, Side::Buy, Decimal::from(105), Decimal::from(20))
+        book.add_limit_order(2, Side::Buy, Decimal::from(105), Decimal::from(20))
             .unwrap();
-        let id3 = book
-            .add_limit_order(3, Side::Buy, Decimal::from(105), Decimal::from(30))
+        book.add_limit_order(3, Side::Buy, Decimal::from(105), Decimal::from(30))
             .unwrap();
-        let _id4 = book
-            .add_limit_order(4, Side::Buy, Decimal::from(105), Decimal::from(40))
+        book.add_limit_order(4, Side::Buy, Decimal::from(105), Decimal::from(40))
             .unwrap();
 
-        book.cancel_order(id1).unwrap();
-        book.cancel_order(id3).unwrap();
+        book.cancel_order(1).unwrap();
+        book.cancel_order(3).unwrap();
 
-        // Level has 4 physical entries (2 tombstones, 2 live)
         let level_idx = 5; // price 105 - base 100 = 5
         book.compact_level(Side::Buy, level_idx);
 
-        // After compaction: head=0, tail=2, 2 live entries, no tombstones
-        // Orders should still be cancellable via order_index
         assert_eq!(book.best_bid(), Some(Decimal::from(105)));
-        book.cancel_order(_id2).unwrap();
-        book.cancel_order(_id4).unwrap();
+        book.cancel_order(2).unwrap();
+        book.cancel_order(4).unwrap();
         assert_eq!(book.best_bid(), None);
     }
 
     #[test]
     fn test_non_tick_aligned_price_rejected() {
-        let mut book = FixedOrderBook::<100, 64>::new(Decimal::from(100), Decimal::new(1, 2)); // tick = 0.01
-        // 100.005 is not aligned to 0.01
+        let mut book = FixedOrderBook::<100, 64>::new(Decimal::from(100), Decimal::new(1, 2));
         assert!(
             book.add_limit_order(1, Side::Buy, Decimal::new(100005, 3), Decimal::from(10))
                 .is_err()
         );
-        // 100.01 is aligned
         assert!(
             book.add_limit_order(2, Side::Buy, Decimal::new(10001, 2), Decimal::from(10))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn test_exact_fill() {
+        let mut book = make_book();
+        book.add_limit_order(1, Side::Sell, Decimal::from(100), Decimal::from(10))
+            .unwrap();
+        let fills = book
+            .add_limit_order(2, Side::Buy, Decimal::from(100), Decimal::from(10))
+            .unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(
+            fills[0],
+            Fill {
+                maker_order_id: 1,
+                taker_order_id: 2,
+                price: Decimal::from(100),
+                quantity: Decimal::from(10),
+            }
+        );
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), None);
+    }
+
+    #[test]
+    fn test_partial_fill_taker_remains() {
+        let mut book = make_book();
+        book.add_limit_order(1, Side::Sell, Decimal::from(100), Decimal::from(5))
+            .unwrap();
+        let fills = book
+            .add_limit_order(2, Side::Buy, Decimal::from(100), Decimal::from(10))
+            .unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].quantity, Decimal::from(5));
+        assert_eq!(book.best_ask(), None);
+        assert_eq!(book.best_bid(), Some(Decimal::from(100)));
+    }
+
+    #[test]
+    fn test_partial_fill_maker_remains() {
+        let mut book = make_book();
+        book.add_limit_order(1, Side::Sell, Decimal::from(100), Decimal::from(10))
+            .unwrap();
+        let fills = book
+            .add_limit_order(2, Side::Buy, Decimal::from(100), Decimal::from(5))
+            .unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].quantity, Decimal::from(5));
+        assert_eq!(book.best_ask(), Some(Decimal::from(100)));
+        assert_eq!(book.best_bid(), None);
+    }
+
+    #[test]
+    fn test_multi_level_sweep() {
+        let mut book = make_book();
+        book.add_limit_order(1, Side::Sell, Decimal::from(100), Decimal::from(5))
+            .unwrap();
+        book.add_limit_order(2, Side::Sell, Decimal::from(101), Decimal::from(5))
+            .unwrap();
+        book.add_limit_order(3, Side::Sell, Decimal::from(102), Decimal::from(5))
+            .unwrap();
+
+        let fills = book
+            .add_limit_order(4, Side::Buy, Decimal::from(102), Decimal::from(12))
+            .unwrap();
+        assert_eq!(fills.len(), 3);
+        assert_eq!(fills[0].maker_order_id, 1);
+        assert_eq!(fills[0].price, Decimal::from(100));
+        assert_eq!(fills[0].quantity, Decimal::from(5));
+        assert_eq!(fills[1].maker_order_id, 2);
+        assert_eq!(fills[1].price, Decimal::from(101));
+        assert_eq!(fills[1].quantity, Decimal::from(5));
+        assert_eq!(fills[2].maker_order_id, 3);
+        assert_eq!(fills[2].price, Decimal::from(102));
+        assert_eq!(fills[2].quantity, Decimal::from(2));
+        assert_eq!(book.best_ask(), Some(Decimal::from(102)));
+        assert_eq!(book.best_bid(), None);
+    }
+
+    #[test]
+    fn test_price_time_priority() {
+        let mut book = make_book();
+        book.add_limit_order(1, Side::Sell, Decimal::from(100), Decimal::from(5))
+            .unwrap();
+        book.add_limit_order(2, Side::Sell, Decimal::from(100), Decimal::from(5))
+            .unwrap();
+
+        let fills = book
+            .add_limit_order(3, Side::Buy, Decimal::from(100), Decimal::from(7))
+            .unwrap();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].maker_order_id, 1);
+        assert_eq!(fills[0].quantity, Decimal::from(5));
+        assert_eq!(fills[1].maker_order_id, 2);
+        assert_eq!(fills[1].quantity, Decimal::from(2));
+    }
+
+    #[test]
+    fn test_no_match_buy_below_asks() {
+        let mut book = make_book();
+        book.add_limit_order(1, Side::Sell, Decimal::from(105), Decimal::from(10))
+            .unwrap();
+        let fills = book
+            .add_limit_order(2, Side::Buy, Decimal::from(100), Decimal::from(10))
+            .unwrap();
+        assert!(fills.is_empty());
+        assert_eq!(book.best_bid(), Some(Decimal::from(100)));
+        assert_eq!(book.best_ask(), Some(Decimal::from(105)));
+    }
+
+    #[test]
+    fn test_sell_matches_bids() {
+        let mut book = make_book();
+        book.add_limit_order(1, Side::Buy, Decimal::from(100), Decimal::from(10))
+            .unwrap();
+        let fills = book
+            .add_limit_order(2, Side::Sell, Decimal::from(100), Decimal::from(10))
+            .unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].maker_order_id, 1);
+        assert_eq!(fills[0].taker_order_id, 2);
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), None);
+    }
+
+    #[test]
+    fn test_sell_sweeps_multiple_bid_levels() {
+        let mut book = make_book();
+        book.add_limit_order(1, Side::Buy, Decimal::from(102), Decimal::from(5))
+            .unwrap();
+        book.add_limit_order(2, Side::Buy, Decimal::from(101), Decimal::from(5))
+            .unwrap();
+        book.add_limit_order(3, Side::Buy, Decimal::from(100), Decimal::from(5))
+            .unwrap();
+
+        let fills = book
+            .add_limit_order(4, Side::Sell, Decimal::from(100), Decimal::from(12))
+            .unwrap();
+        assert_eq!(fills.len(), 3);
+        // Fills at highest bid first
+        assert_eq!(fills[0].maker_order_id, 1);
+        assert_eq!(fills[0].price, Decimal::from(102));
+        assert_eq!(fills[1].maker_order_id, 2);
+        assert_eq!(fills[1].price, Decimal::from(101));
+        assert_eq!(fills[2].maker_order_id, 3);
+        assert_eq!(fills[2].price, Decimal::from(100));
+        assert_eq!(fills[2].quantity, Decimal::from(2));
+    }
+
+    #[test]
+    fn test_tombstone_skipping_during_match() {
+        let mut book = make_book();
+        book.add_limit_order(1, Side::Sell, Decimal::from(100), Decimal::from(5))
+            .unwrap();
+        book.add_limit_order(2, Side::Sell, Decimal::from(100), Decimal::from(5))
+            .unwrap();
+        book.add_limit_order(3, Side::Sell, Decimal::from(100), Decimal::from(5))
+            .unwrap();
+
+        // Cancel the middle order (creates tombstone in the ring)
+        book.cancel_order(2).unwrap();
+
+        let fills = book
+            .add_limit_order(4, Side::Buy, Decimal::from(100), Decimal::from(8))
+            .unwrap();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].maker_order_id, 1);
+        assert_eq!(fills[0].quantity, Decimal::from(5));
+        assert_eq!(fills[1].maker_order_id, 3);
+        assert_eq!(fills[1].quantity, Decimal::from(3));
+    }
+
+    #[test]
+    fn test_market_buy() {
+        let mut book = make_book();
+        book.add_limit_order(1, Side::Sell, Decimal::from(100), Decimal::from(10))
+            .unwrap();
+        book.add_limit_order(2, Side::Sell, Decimal::from(110), Decimal::from(10))
+            .unwrap();
+
+        let fills = book.add_market_order(3, Side::Buy, Decimal::from(15));
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].price, Decimal::from(100));
+        assert_eq!(fills[0].quantity, Decimal::from(10));
+        assert_eq!(fills[1].price, Decimal::from(110));
+        assert_eq!(fills[1].quantity, Decimal::from(5));
+        assert_eq!(book.best_bid(), None);
+    }
+
+    #[test]
+    fn test_market_sell() {
+        let mut book = make_book();
+        book.add_limit_order(1, Side::Buy, Decimal::from(100), Decimal::from(10))
+            .unwrap();
+
+        let fills = book.add_market_order(2, Side::Sell, Decimal::from(10));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].price, Decimal::from(100));
+        assert_eq!(book.best_bid(), None);
+    }
+
+    #[test]
+    fn test_market_order_insufficient_liquidity() {
+        let mut book = make_book();
+        book.add_limit_order(1, Side::Sell, Decimal::from(100), Decimal::from(5))
+            .unwrap();
+
+        let fills = book.add_market_order(2, Side::Buy, Decimal::from(10));
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].quantity, Decimal::from(5));
+        // Unfilled portion is discarded, not rested
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), None);
     }
 }
